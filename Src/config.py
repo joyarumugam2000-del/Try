@@ -1,24 +1,28 @@
-import os
-from dotenv import load_dotenv
+# ==============================
+# Telegram Bot Configuration
+# ==============================
 
-# Load .env file
-load_dotenv()
+# Bot token from @BotFather
+BOT_TOKEN = "8009833248:AAFGG6NnHPzQdg0nRxf4PaGVVpzwyhKgbLg"
 
-# 🔹 Core bot settings
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0"))
+# Telegram API credentials (from https://my.telegram.org)
+API_ID = 1234567  # <-- replace with your real API ID
+API_HASH = "abcd1234efgh5678ijkl9012mnop3456"  # <-- replace with your real API HASH
 
-# 🔹 Groups & logging
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
-DVA_GROUP_ID = int(os.getenv("DVA_GROUP_ID", "0"))
+# Owner and logging
+OWNER_ID = 1798791768                 # Bot owner's Telegram user ID
+LOG_CHANNEL_ID = -1002412313028       # Channel/group ID for logs
 
-# 🔹 Escrow / anti-scam settings
-ESCROW_FEE_RATE = float(os.getenv("ESCROW_FEE_RATE", "0.01"))  # default 1%
-SIMILARITY_THRESHOLD = int(os.getenv("SIMILARITY_THRESHOLD", "85"))  # fuzzy username check
-AUTO_KICK_DELAY = int(os.getenv("AUTO_KICK_DELAY", "300"))  # 5 minutes
+# Scam detection settings
+MIN_SIMILARITY = 0.85                 # Username similarity threshold
 
-# 🔹 Database
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+# Escrow/DVA settings
+ESCROW_FEE_PERCENT = 1.0              # % fee for escrow deals
+DVA_GROUP_LINK = "https://t.me/+ppr7nkHxwWs4YmNl"  # DVA/escrow group link
 
-# ✅ Backwards compatibility (so main.py still works)
-OWNER_ID = BOT_OWNER_ID
+# Database file
+DB_PATH = "bot_database.sqlite3"
+
+# ==============================
+# End of Config
+# ==============================
