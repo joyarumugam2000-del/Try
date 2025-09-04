@@ -1,39 +1,30 @@
-import re
-import string
 import random
+import string
 import time
-from datetime import datetime, timezone
-from typing import Optional
 from telegram.ext import ContextTypes
+from telegram import ChatMember
 
-async def is_owner(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    owner_id = int(context.bot_data.get("OWNER_ID", 0))
-    return user_id == owner_id
+# Generate deal code like DL-ABCDEFGH
+def gen_deal_code() -> str:
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    return f"DL-{suffix}"
 
-async def is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    try:
-        cm = await context.bot.get_chat_member(chat_id, user_id)
-        return cm.status in ("administrator", "creator")
-    except Exception:
-        return False
-
+# Current timestamp
 def now_ts() -> int:
     return int(time.time())
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# Check if user is owner
+async def is_owner(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    return str(user_id) == str(context.bot_data.get("OWNER_ID"))
 
-def gen_deal_code() -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "DL-" + "".join(random.choice(alphabet) for _ in range(8))
+# Check if user is admin in chat
+async def is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in [ChatMember.ADMINISTRATOR, ChatMember.CREATOR]
+    except Exception:
+        return False
 
-def parse_user_mention(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = re.search(r'@([A-Za-z0-9_]{5,})', text)
-    if m:
-        return m.group(1)
-    m = re.search(r'\b(\d{6,})\b', text)
-    if m:
-        return m.group(1)
-    return None
+# Optional: parse @username mentions or IDs
+def parse_user_mention(text: str) -> str:
+    return text.strip()
