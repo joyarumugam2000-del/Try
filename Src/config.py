@@ -17,8 +17,9 @@ LOG_CHANNEL_ID = -1002412313028       # Channel/group ID for logs
 MIN_SIMILARITY = 0.85                 # Username similarity threshold
 
 # Escrow/DVA settings
-ESCROW_FEE_PERCENT = 1.0              # % fee for escrow deals
+ESCROW_FEE_RATE = 0.01                # 1% fee (0.01 = 1%)
 DVA_GROUP_LINK = "https://t.me/+ppr7nkHxwWs4YmNl"  # DVA/escrow group link
+KICK_AFTER_SECONDS = 300              # Kick users after 300s (5 minutes) if not approved
 
 # Database file
 DB_PATH = "bot_database.sqlite3"
