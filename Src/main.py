@@ -10,7 +10,7 @@ from telegram.ext import (
 
 from .config import BOT_TOKEN, OWNER_ID, LOG_CHANNEL_ID, MIN_SIMILARITY
 from . import db
-from .anti_scam import skeleton, looks_like
+from .anti_scam import skeleton, looks_like, on_new_members, on_left_member, on_any_message
 from .deals import build_handlers as build_deal_handlers, _send_dva_link
 from .utils import now_ts, is_admin, is_owner, parse_user_mention
 
@@ -125,43 +125,30 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Store bot owner & log channel
     app.bot_data["OWNER_ID"] = str(OWNER_ID)
     app.bot_data["LOG_CHANNEL_ID"] = str(LOG_CHANNEL_ID)
 
     # Init DB
     db.init_db()
 
-    # Basic commands & menu
+    # Basic commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", lambda u,c: u.effective_message.reply_text(help_text(), parse_mode=ParseMode.MARKDOWN)))
-
-    # Suspect / GBAN commands
-    from .suspects import cmd_suspects, cb_suspect
-    app.add_handler(CommandHandler("suspects", cmd_suspects))
-    app.add_handler(CallbackQueryHandler(cb_suspect, pattern=r"^suspect:\d+:(approve|gban)$"))
-
-    from .gban import cmd_gban, cmd_ungban
-    app.add_handler(CommandHandler("gban", cmd_gban))
-    app.add_handler(CommandHandler("ungban", cmd_ungban))
 
     # DVA/Escrow
     app.add_handler(MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), on_dva_request))
     app.add_handler(CallbackQueryHandler(cb_dva_pm, pattern=r"^dva_pm:\d+$"))
 
-    # Add Deal Conversation Handlers
+    # Deal form handlers
     for h in build_deal_handlers():
         app.add_handler(h)
 
-    # New / left members
-    from .anti_scam import on_new_members, on_left_member, on_any_message
+    # Anti-scam members
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
-
-    # Enforce GBAN on any message
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_any_message))
 
-    # Inline menu
+    # Inline menus
     app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^menu:"))
 
     # Error handler
