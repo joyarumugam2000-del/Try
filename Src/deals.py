@@ -1,11 +1,19 @@
+# deals.py
 from typing import Dict, Any, Optional
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
-from .config import ESCROW_FEE_RATE, KICK_AFTER_SECONDS
-from .db import add_deal, set_deal_message, mark_deal_closed, add_invite_link, get_setting, set_setting
+from telegram.ext import (
+    ContextTypes, ConversationHandler, MessageHandler,
+    CommandHandler, CallbackQueryHandler, filters
+)
+from .db import add_deal, set_deal_message, mark_deal_closed, add_invite_link, get_setting
 from .utils import gen_deal_code, now_ts, is_admin, is_owner
+from .config import ESCROW_FEE_RATE, KICK_AFTER_SECONDS
 
-# --- DVA / Escrow one-time link ---
+# --- Conversation states ---
+ASK_BUYER, ASK_SELLER, ASK_AMOUNT, CONFIRM = range(4)
+pending_forms: Dict[int, Dict[str, Any]] = {}
+
+# --- DVA/Escrow ---
 async def _send_dva_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Optional[str]:
     chat_id = int(get_setting("DVA_GROUP_ID") or 0)
     if not chat_id:
@@ -15,7 +23,7 @@ async def _send_dva_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Op
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"Here is your one-time invite link to the DVA/Escrow room:\n{link.invite_link}\n⚠️ This link will be revoked after you join."
+            text=f"Here is your one-time invite link:\n{link.invite_link}\n⚠️ Will expire after join."
         )
     except Exception:
         pass
@@ -25,58 +33,113 @@ async def trigger_dva_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     link = await _send_dva_link(context, user.id)
     if link:
-        await update.effective_message.reply_text("I sent you a one-time invite link in DM. Check your PMs.")
+        await update.effective_message.reply_text("I sent you a one-time DVA/Escrow link in DM.")
     else:
-        await update.effective_message.reply_text("DVA/Escrow group is not set. Owner must run /dvaonly in target group.")
+        await update.effective_message.reply_text("DVA/Escrow group not set. Owner must run /dvaonly.")
 
 async def cmd_dvaonly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
     if not await is_owner(context, user.id):
         return
+    from .db import set_setting
     set_setting("DVA_GROUP_ID", str(chat.id))
-    await update.effective_message.reply_text(f"This chat is now set as the DVA/Escrow room (chat_id={chat.id}).")
+    await update.effective_message.reply_text(f"This chat is now the DVA/Escrow room (chat_id={chat.id}).")
 
-# --- Direct deal message in group ---
-async def parse_deal_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    text = msg.text or ""
-    lines = [line.strip() for line in text.splitlines()]
-    if len(lines) < 3:
-        return
+# --- Deal Form ---
+async def start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    pending_forms[user_id] = {"buyer": None, "seller": None, "amount": None}
+    await update.effective_message.reply_text("Buyer username? (e.g., @buyer)")
+    return ASK_BUYER
 
-    # Parse fields
-    data = {}
-    for line in lines:
-        if line.lower().startswith("buyer:"):
-            data["buyer"] = line.split(":", 1)[1].strip()
-        elif line.lower().startswith("seller:"):
-            data["seller"] = line.split(":", 1)[1].strip()
-        elif line.lower().startswith("amount:"):
-            try:
-                data["amount"] = float(line.split(":", 1)[1].strip())
-            except Exception:
-                await msg.reply_text("Invalid amount. Use numbers only.")
-                return
-        elif line.lower().startswith("description:"):
-            data["description"] = line.split(":", 1)[1].strip()
+async def ask_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    pending_forms[user_id]["buyer"] = update.effective_message.text.strip()
+    await update.effective_message.reply_text("Seller username? (e.g., @seller)")
+    return ASK_SELLER
 
-    if not all(k in data for k in ("buyer", "seller", "amount", "description")):
-        return
+async def ask_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    pending_forms[user_id]["seller"] = update.effective_message.text.strip()
+    await update.effective_message.reply_text("Deal amount? (numbers only, e.g., 2500)")
+    return ASK_AMOUNT
 
+async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        amt = float(update.effective_message.text.strip())
+    except Exception:
+        await update.effective_message.reply_text("Please send a valid number amount.")
+        return ASK_AMOUNT
+
+    pending_forms[user_id]["amount"] = amt
     code = gen_deal_code()
-    fee = round(data["amount"] * ESCROW_FEE_RATE, 2)
+    pending_forms[user_id]["code"] = code
+    fee = round(amt * ESCROW_FEE_RATE, 2)
 
-    # Save deal
-    did = add_deal(code, data["buyer"], data["seller"], data["amount"], fee, msg.from_user.id, now_ts())
-    await msg.reply_text(
-        f"🧾 Deal `{code}`\nBuyer: {data['buyer']}\nSeller: {data['seller']}\nAmount: {data['amount']}\n"
-        f"Fee: {fee}\nDescription: {data['description']}\n\nAdmin, reply `add` to start the deal.",
-        parse_mode="Markdown"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Submit to DVA group", callback_data=f"deal_submit:{code}")],
+        [InlineKeyboardButton("Cancel", callback_data=f"deal_cancel:{code}")]
+    ])
+
+    b = pending_forms[user_id]["buyer"]
+    s = pending_forms[user_id]["seller"]
+    await update.effective_message.reply_text(
+        f"Deal draft `{code}`\nBuyer: {b}\nSeller: {s}\nAmount: {amt}\nEscrow fee (1%): {fee}\nSubmit to DVA group?",
+        parse_mode="Markdown",
+        reply_markup=kb
     )
-    set_deal_message(code, msg.chat.id, msg.message_id)
+    return CONFIRM
 
-# --- Admin add / close ---
+async def cancel_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending_forms.pop(update.effective_user.id, None)
+    await update.effective_message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+# --- CallbackQuery for submit/cancel ---
+async def cb_deal_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    user_id = q.from_user.id
+
+    if data.startswith("deal_cancel:"):
+        code = data.split(":")[1]
+        pending_forms.pop(user_id, None)
+        await q.edit_message_text(f"Deal draft `{code}` cancelled.", parse_mode="Markdown")
+        return
+
+    if data.startswith("deal_submit:"):
+        code = data.split(":")[1]
+        form = pending_forms.get(user_id)
+        if not form:
+            await q.edit_message_text("Session expired. Please /form again.")
+            return
+
+        chat_id = int(get_setting("DVA_GROUP_ID") or 0)
+        if not chat_id:
+            await q.edit_message_text("DVA/Escrow group not set. Owner must run /dvaonly.")
+            return
+
+        amount = float(form["amount"])
+        fee = round(amount * ESCROW_FEE_RATE, 2)
+        did = add_deal(code, form["buyer"], form["seller"], amount, fee, user_id, now_ts())
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🧾 Deal `{code}`\nBuyer: {form['buyer']}\nSeller: {form['seller']}\n"
+                f"Amount: {amount}\nFee: {fee}\nAdded by: @{q.from_user.username or 'admin'}\n\n"
+                "Reply `add` to open this deal."
+            ),
+            parse_mode="Markdown"
+        )
+
+        set_deal_message(code, msg.chat_id, msg.message_id)
+        pending_forms.pop(user_id, None)
+
+# --- Admin Add/Close ---
 async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.text.strip().lower() != "add" or not msg.reply_to_message:
@@ -86,16 +149,14 @@ async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(context, chat_id, user_id):
         return
 
-    text = msg.reply_to_message.text
     import re
-    m = re.search(r'`(DL-[A-Z0-9]{8})`', text)
+    m = re.search(r'`(DL-[A-Z0-9]{8})`', msg.reply_to_message.text or "")
     if not m:
-        await msg.reply_text("Couldn't find deal code in replied message.")
         return
     code = m.group(1)
-
-    # Update deal with admin who added
-    await msg.reply_to_message.reply_text(f"✅ Deal `{code}` opened by admin {msg.from_user.mention_markdown()}", parse_mode="Markdown")
+    # Save who added
+    from .db import add_deal  # already saved in db when submitted
+    await msg.reply_to_message.reply_text(f"✅ Deal `{code}` opened. Admin @{msg.from_user.username} added.")
 
 async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -106,22 +167,20 @@ async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not await is_admin(context, chat_id, user_id):
         return
 
-    text = msg.reply_to_message.text
     import re
-    m = re.search(r'`(DL-[A-Z0-9]{8})`', text)
+    m = re.search(r'`(DL-[A-Z0-9]{8})`', msg.reply_to_message.text or "")
     if not m:
-        await msg.reply_text("Couldn't find deal code in replied message.")
+        await msg.reply_text("Could not find deal code in the replied message.")
         return
     code = m.group(1)
 
     mark_deal_closed(code)
     await msg.reply_to_message.reply_text(
-        f"✅ Deal `{code}` closed by admin {msg.from_user.mention_markdown()}.\nUsers joined via one-time links will be kicked in 5 minutes.",
+        f"✅ Deal `{code}` closed.\nClosed by: @{msg.from_user.username}",
         parse_mode="Markdown"
     )
-    # Schedule kick job
-    context.job_queue.run_once(kick_job, when=KICK_AFTER_SECONDS, data={"code": code, "chat_id": chat_id})
 
+# --- Stay callback & kick ---
 async def cb_stay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("Kick canceled for you (if scheduled).")
@@ -139,9 +198,21 @@ async def kick_job(context: ContextTypes.DEFAULT_TYPE):
 def build_handlers():
     return [
         CommandHandler("dvaonly", cmd_dvaonly),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, parse_deal_message),
-        MessageHandler(filters.Regex(r"(?i)^add$") & filters.REPLY, admin_keyword_add),
-        MessageHandler(filters.Regex(r"(?i)^close$") & filters.REPLY, admin_keyword_close),
+        CommandHandler("form", start_form),
+        ConversationHandler(
+            entry_points=[CommandHandler("form", start_form)],
+            states={
+                ASK_BUYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_buyer)],
+                ASK_SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_seller)],
+                ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_amount)],
+                CONFIRM: [CallbackQueryHandler(cb_deal_actions, pattern=r"^deal_(submit|cancel):")]
+            },
+            fallbacks=[CommandHandler("cancel", cancel_form)],
+            name="DEAL_FORM",
+            persistent=False
+        ),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_add),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_close),
         CallbackQueryHandler(cb_stay, pattern=r"^stay:"),
         MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), trigger_dva_link)
-    ]
+]
