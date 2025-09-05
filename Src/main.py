@@ -47,7 +47,7 @@ async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if key == "form":
         await q.edit_message_text(
-            "Use /form to start a deal form.",
+            "Use /form to start a deal form in this group.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu:main")]])
         )
     elif key == "help":
@@ -92,6 +92,11 @@ def commands_text() -> str:
         "/dvaonly – (Owner) Run inside your DVA group to mark it"
     )
 
+# ----------------- DVA/Escrow link ----------------
+async def trigger_dva_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await _send_dva_link(context, user_id)
+
 # ----------------- Main -----------------
 def main():
     if not BOT_TOKEN:
@@ -108,14 +113,14 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", lambda u,c: u.effective_message.reply_text(help_text(), parse_mode=ParseMode.MARKDOWN)))
 
-    # DVA/Escrow handlers
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), lambda u,c: _send_dva_link(c, u.effective_user.id)))
-    
-    # Deal form handlers
+    # DVA/Escrow link handler
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), trigger_dva_link))
+
+    # Deal form handlers (user fills, admin add/close)
     for h in build_deal_handlers():
         app.add_handler(h)
 
-    # Anti-scam
+    # Anti-scam handlers
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_any_message))
