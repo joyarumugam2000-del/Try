@@ -1,6 +1,8 @@
 import re
 from typing import Tuple
 from . import db
+from telegram import Update
+from telegram.ext import ContextTypes
 
 # ----------------- Anti-Scam Utilities -----------------
 def skeleton(username: str) -> str:
@@ -26,10 +28,10 @@ def looks_like(new_username: str, old_username: str, min_similarity: float = 0.8
     return score >= min_similarity, score, reason
 
 # ----------------- Handlers -----------------
-async def on_new_members(update, context):
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
-    ts = int(update.effective_message.date.timestamp())
+    ts = int(msg.date.timestamp())
 
     # Register group in DB
     try:
@@ -70,20 +72,41 @@ async def on_new_members(update, context):
             sid = db.add_suspect(chat.id, m.id, uname, matched, int(best_score*100), reason, ts)
             # You can add InlineKeyboardMarkup here for admin approve/GBAN if needed
 
-async def on_left_member(update, context):
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = msg.left_chat_member
     if not user:
         return
-    ts = int(update.effective_message.date.timestamp())
+    ts = int(msg.date.timestamp())
     db.add_user_profile(user.id, user.username or "", user.first_name or "", user.last_name or "", skeleton(user.username or ""), ts)
 
-async def on_any_message(update, context):
+async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    if not msg:
+        return
     user = msg.from_user
-    chat = update.effective_chat
+    chat = msg.chat
     if db.is_gbanned(user.id):
         try:
             await context.bot.ban_chat_member(chat.id, user.id)
         except Exception:
             pass
+
+# ----------------- Optional: integrate with deal form -----------------
+async def check_deal_form_format(text: str) -> bool:
+    """
+    Check if the message matches the expected deal form structure:
+    Seller: @username
+    Buyer: @username
+    Amount: number
+    Payment mode: text
+    Description: text
+    """
+    pattern = (
+        r"Seller:\s*@[\w\d_]{5,32}\s*"
+        r"Buyer:\s*@[\w\d_]{5,32}\s*"
+        r"Amount:\s*\d+\s*"
+        r"Payment mode:\s*.+\s*"
+        r"Description:\s*.+"
+    )
+    return bool(re.search(pattern, text, re.IGNORECASE))
