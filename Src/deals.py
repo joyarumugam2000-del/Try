@@ -59,14 +59,12 @@ async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             key, val = line.split(":", 1)
             data[key.strip().lower()] = val.strip()
 
-    # Flexible key parsing
     buyer = data.get("buyer")
     seller = data.get("seller")
     amount_str = data.get("amount")
     payment_mode = data.get("payment mode", "")
     description = data.get("description", "")
 
-    # Validation
     try:
         amount = float(amount_str)
     except (TypeError, ValueError):
@@ -77,12 +75,10 @@ async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     code = gen_deal_code()
-    fee = round(amount * 0.01, 2)  # 1% fee
+    fee = round(amount * 0.01, 2)
 
-    # Save deal in DB
-    did = add_deal(code, buyer, seller, amount, fee, user_id, now_ts(), admin_add=admin_name)
+    add_deal(code, buyer, seller, amount, fee, user_id, now_ts(), admin_add=admin_name)
 
-    # Send deal message to group
     deal_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -114,7 +110,6 @@ async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text("❌ You must be an admin to close a deal.")
         return
 
-    # Extract deal code
     m = re.search(r'`(DL-[A-Z0-9]{8})`', msg.reply_to_message.text or "")
     if not m:
         await msg.reply_text("❌ Cannot find deal code in the replied message.")
@@ -135,4 +130,4 @@ def build_handlers():
         MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), trigger_dva_link),
         MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_add),
         MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_close),
-                                                                               ]
+]
