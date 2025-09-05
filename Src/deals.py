@@ -1,11 +1,11 @@
 import re
-from typing import Dict, Any, Optional
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from typing import Optional, Dict
+from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 from .utils import gen_deal_code, now_ts, is_admin
 from .db import add_deal, set_deal_message, mark_deal_closed, get_setting, set_setting, add_invite_link
 
-# --- DVA / Escrow one-time link ---
+# ------------------ DVA / Escrow link ------------------
 async def _send_dva_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Optional[str]:
     chat_id = int(get_setting("DVA_GROUP_ID") or 0)
     if not chat_id:
@@ -37,7 +37,7 @@ async def cmd_dvaonly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("DVA_GROUP_ID", str(chat.id))
     await update.effective_message.reply_text(f"This chat is now set as the DVA/Escrow room (chat_id={chat.id}).")
 
-# --- Admin adds deal by replying 'add' ---
+# ------------------ Admin adds a deal ------------------
 async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.text.strip().lower() != "add" or not msg.reply_to_message:
@@ -48,30 +48,41 @@ async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_name = update.effective_user.username or update.effective_user.first_name
 
     if not await is_admin(context, chat_id, user_id):
+        await msg.reply_text("❌ You must be an admin to add a deal.")
         return
 
+    # Parse form lines
     lines = msg.reply_to_message.text.splitlines()
-    data = {}
+    data: Dict[str, str] = {}
     for line in lines:
         if ":" in line:
             key, val = line.split(":", 1)
             data[key.strip().lower()] = val.strip()
 
+    # Flexible key parsing
     buyer = data.get("buyer")
     seller = data.get("seller")
-    amount = float(data.get("amount", 0))
+    amount_str = data.get("amount")
     payment_mode = data.get("payment mode", "")
     description = data.get("description", "")
 
-    if not buyer or not seller or not amount:
-        await msg.reply_text("Form missing required fields.")
+    # Validation
+    try:
+        amount = float(amount_str)
+    except (TypeError, ValueError):
+        await msg.reply_text("❌ Amount is missing or invalid in the form.")
+        return
+    if not buyer or not seller:
+        await msg.reply_text("❌ Buyer or Seller missing in the form.")
         return
 
     code = gen_deal_code()
     fee = round(amount * 0.01, 2)  # 1% fee
 
+    # Save deal in DB
     did = add_deal(code, buyer, seller, amount, fee, user_id, now_ts(), admin_add=admin_name)
 
+    # Send deal message to group
     deal_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -89,7 +100,7 @@ async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_deal_message(code, deal_msg.chat_id, deal_msg.message_id)
     await msg.reply_text(f"✅ Deal `{code}` added successfully.", parse_mode="Markdown")
 
-# --- Admin closes deal by replying 'close' ---
+# ------------------ Admin closes a deal ------------------
 async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.text.strip().lower() != "close" or not msg.reply_to_message:
@@ -100,11 +111,13 @@ async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE
     admin_name = update.effective_user.username or update.effective_user.first_name
 
     if not await is_admin(context, chat_id, user_id):
+        await msg.reply_text("❌ You must be an admin to close a deal.")
         return
 
+    # Extract deal code
     m = re.search(r'`(DL-[A-Z0-9]{8})`', msg.reply_to_message.text or "")
     if not m:
-        await msg.reply_text("Cannot find deal code in the replied message.")
+        await msg.reply_text("❌ Cannot find deal code in the replied message.")
         return
 
     code = m.group(1)
@@ -115,11 +128,11 @@ async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown"
     )
 
-# --- Build handlers for main.py ---
+# ------------------ Build Handlers ------------------
 def build_handlers():
     return [
         CommandHandler("dvaonly", cmd_dvaonly),
         MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), trigger_dva_link),
         MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_add),
         MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_close),
-        ]
+                                                                               ]
