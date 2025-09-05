@@ -8,17 +8,17 @@ from telegram.ext import (
 )
 from .config import BOT_TOKEN, OWNER_ID, LOG_CHANNEL_ID
 from . import db
-from .anti_scam import skeleton, looks_like, on_new_members, on_left_member, on_any_message
-from .deals import build_handlers as build_deal_handlers, _send_dva_link
-from .utils import now_ts, is_admin, is_owner
+from .anti_scam import on_new_members, on_left_member, on_any_message
+from .deals import build_handlers as build_deal_handlers, trigger_dva_link
+from .utils import is_admin
 
+# ---------------- Logging ----------------
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO
 )
 log = logging.getLogger("bot")
 
-# ---------------- Logging ----------------
 async def log_event(context: ContextTypes.DEFAULT_TYPE, text: str):
     chat_id = LOG_CHANNEL_ID or int(context.bot_data.get("LOG_CHANNEL_ID", 0) or 0)
     if not chat_id:
@@ -47,7 +47,9 @@ async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if key == "form":
         await q.edit_message_text(
-            "Use /form to start a deal form in this group.",
+            "Post your deal in this format:\n\n"
+            "Seller: @username\nBuyer: @username\nAmount: 5000\nPayment mode: UPI\nDescription: Payment for X\n\n"
+            "Admin will reply 'add' to start the deal.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="menu:main")]])
         )
     elif key == "help":
@@ -74,30 +76,24 @@ def help_text() -> str:
         "• I watch joins and flag look-alike usernames for admin review.\n"
         "• Admins can Approve/GBAN suspects.\n\n"
         "*DVA/Escrow*\n"
-        "• Say 'escrow' or 'dva' in any group → I'll DM a one-time invite link.\n"
-        "• Use /form to submit buyer, seller, amount (fee auto-calculated).\n"
-        "• Admin replies 'add' to open the deal, 'close' to close it.\n\n"
+        "• Say 'escrow' or 'dva' in group → get a one-time invite link in PM.\n"
+        "• Post deal form in group → Admin replies 'add' to open deal, 'close' to close deal.\n\n"
         "*Global Ban*\n"
-        "• Owner can /gban (reply) and /ungban users."
+        "• Owner can /gban and /ungban users."
     )
 
 def commands_text() -> str:
     return (
         "/start – Menu\n"
-        "/help – This help\n"
-        "/form – Start a deal form\n"
-        "/suspects – Show pending username look-alike suspects (admins)\n"
-        "/gban – (Owner) Reply or pass @user/ID to add global ban\n"
+        "/help – Show help\n"
+        "/form – Instructions for deal form\n"
+        "/suspects – Show pending look-alike suspects (admins)\n"
+        "/gban – (Owner) Reply or pass @user/ID to global ban\n"
         "/ungban – (Owner) Remove global ban\n"
-        "/dvaonly – (Owner) Run inside your DVA group to mark it"
+        "/dvaonly – (Owner) Run inside DVA group to set it"
     )
 
-# ----------------- DVA/Escrow link ----------------
-async def trigger_dva_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await _send_dva_link(context, user_id)
-
-# ----------------- Main -----------------
+# ---------------- Main ----------------
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN missing. Put in config or .env")
@@ -109,26 +105,26 @@ def main():
     # Init DB
     db.init_db()
 
-    # Basic commands
+    # ---------------- Basic Commands ----------------
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", lambda u,c: u.effective_message.reply_text(help_text(), parse_mode=ParseMode.MARKDOWN)))
 
-    # DVA/Escrow link handler
+    # ---------------- DVA/Escrow ----------------
     app.add_handler(MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), trigger_dva_link))
 
-    # Deal form handlers (user fills, admin add/close)
+    # ---------------- Deal Form Handlers ----------------
     for h in build_deal_handlers():
         app.add_handler(h)
 
-    # Anti-scam handlers
+    # ---------------- Anti-Scam ----------------
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, on_any_message))
 
-    # Inline menu
+    # ---------------- Inline Menu ----------------
     app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^menu:"))
 
-    # Error logging
+    # ---------------- Error Logging ----------------
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Update error: %s", context.error)
         try:
