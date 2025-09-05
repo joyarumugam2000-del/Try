@@ -1,14 +1,11 @@
+import re
 from typing import Dict, Any, Optional
-from telegram import Update
-from telegram.ext import ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, ConversationHandler, filters
-from .db import add_deal, mark_deal_closed, set_deal_message, add_invite_link, get_setting, set_setting
-from .utils import gen_deal_code, now_ts, is_admin, is_owner
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
+from .utils import gen_deal_code, now_ts, is_admin
+from .db import add_deal, set_deal_message, mark_deal_closed, get_setting, set_setting, add_invite_link
 
-# --- States ---
-ASK_FORM = range(1)
-pending_forms: Dict[int, Dict[str, Any]] = {}
-
-# --- DVA / Escrow link ---
+# --- DVA / Escrow one-time link ---
 async def _send_dva_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Optional[str]:
     chat_id = int(get_setting("DVA_GROUP_ID") or 0)
     if not chat_id:
@@ -18,85 +15,111 @@ async def _send_dva_link(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Op
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"Here is your one-time DVA/Escrow link:\n{link.invite_link}"
+            text=f"Here is your one-time invite link to the DVA/Escrow room:\n{link.invite_link}\n⚠️ Link revoked after join."
         )
     except Exception:
         pass
     return link.invite_link
 
-# --- Form trigger ---
-async def start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Please fill your deal like this in the group:\n\n"
-        "Seller: @seller\n"
-        "Buyer: @buyer\n"
-        "Amount: 2500\n"
-        "Payment mode: UPI / Bank / Cash\n"
-        "Description: Payment for X\n\n"
-        "Admin will reply `add` to start your deal."
-    )
-    return ASK_FORM
+async def trigger_dva_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    link = await _send_dva_link(context, user.id)
+    if link:
+        await update.effective_message.reply_text("✅ Check your PM for the one-time DVA/Escrow link.")
+    else:
+        await update.effective_message.reply_text("DVA/Escrow group not set. Owner must run /dvaonly.")
 
-# --- Admin add deal ---
-async def admin_add_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_dvaonly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if str(user.id) != str(context.bot_data.get("OWNER_ID")):
+        return
+    set_setting("DVA_GROUP_ID", str(chat.id))
+    await update.effective_message.reply_text(f"This chat is now set as the DVA/Escrow room (chat_id={chat.id}).")
+
+# --- Admin adds deal by replying 'add' ---
+async def admin_keyword_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.text.strip().lower() != "add" or not msg.reply_to_message:
         return
-    admin_id = update.effective_user.id
+
     chat_id = update.effective_chat.id
-    if not await is_admin(context, chat_id, admin_id):
+    user_id = update.effective_user.id
+    admin_name = update.effective_user.username or update.effective_user.first_name
+
+    if not await is_admin(context, chat_id, user_id):
         return
 
-    # Parse deal info
-    text = msg.reply_to_message.text
-    lines = text.splitlines()
-    try:
-        seller = lines[0].split(":", 1)[1].strip()
-        buyer = lines[1].split(":", 1)[1].strip()
-        amount = float(lines[2].split(":", 1)[1].strip())
-        payment_mode = lines[3].split(":", 1)[1].strip()
-        description = lines[4].split(":", 1)[1].strip()
-    except Exception:
-        await msg.reply_text("❌ Invalid form format. Make sure all fields are present.")
+    lines = msg.reply_to_message.text.splitlines()
+    data = {}
+    for line in lines:
+        if ":" in line:
+            key, val = line.split(":", 1)
+            data[key.strip().lower()] = val.strip()
+
+    buyer = data.get("buyer")
+    seller = data.get("seller")
+    amount = float(data.get("amount", 0))
+    payment_mode = data.get("payment mode", "")
+    description = data.get("description", "")
+
+    if not buyer or not seller or not amount:
+        await msg.reply_text("Form missing required fields.")
         return
 
-    fee = round(amount * 0.01, 2)  # 1% fee
     code = gen_deal_code()
-    deal_id = add_deal(code, buyer, seller, amount, fee, admin_id, now_ts())
+    fee = round(amount * 0.01, 2)  # 1% fee
 
-    await msg.reply_text(
-        f"🧾 Deal `{code}` added by admin @{update.effective_user.username}\n"
-        f"Buyer: {buyer}\nSeller: {seller}\nAmount: {amount}\nPayment mode: {payment_mode}\n"
-        f"Fee (1%): {fee}\nDescription: {description}\n\n"
-        "Reply `close` to close this deal when finished."
+    did = add_deal(code, buyer, seller, amount, fee, user_id, now_ts(), admin_add=admin_name)
+
+    deal_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🧾 Deal `{code}`\n"
+            f"Buyer: {buyer}\n"
+            f"Seller: {seller}\n"
+            f"Amount: {amount}\n"
+            f"Fee: {fee}\n"
+            f"Payment mode: {payment_mode}\n"
+            f"Description: {description}\n"
+            f"Added by Admin: @{admin_name}\n\n"
+            "Reply 'close' to finish this deal."
+        )
     )
+    set_deal_message(code, deal_msg.chat_id, deal_msg.message_id)
+    await msg.reply_text(f"✅ Deal `{code}` added successfully.", parse_mode="Markdown")
 
-# --- Admin close deal ---
-async def admin_close_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Admin closes deal by replying 'close' ---
+async def admin_keyword_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.text.strip().lower() != "close" or not msg.reply_to_message:
         return
-    admin_id = update.effective_user.id
+
     chat_id = update.effective_chat.id
-    if not await is_admin(context, chat_id, admin_id):
+    user_id = update.effective_user.id
+    admin_name = update.effective_user.username or update.effective_user.first_name
+
+    if not await is_admin(context, chat_id, user_id):
         return
 
-    import re
     m = re.search(r'`(DL-[A-Z0-9]{8})`', msg.reply_to_message.text or "")
     if not m:
-        await msg.reply_text("❌ Couldn't find deal code in the replied message.")
+        await msg.reply_text("Cannot find deal code in the replied message.")
         return
+
     code = m.group(1)
-    mark_deal_closed(code)
+    mark_deal_closed(code, admin_close=admin_name)
 
     await msg.reply_to_message.reply_text(
-        f"✅ Deal `{code}` closed by admin @{update.effective_user.username}."
+        f"✅ Deal `{code}` closed by Admin @{admin_name}.",
+        parse_mode="Markdown"
     )
 
-# --- Build handlers ---
+# --- Build handlers for main.py ---
 def build_handlers():
     return [
-        CommandHandler("form", start_form),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_deal),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_close_deal),
-    ]
+        CommandHandler("dvaonly", cmd_dvaonly),
+        MessageHandler(filters.Regex(r"(?i)\b(dva|escrow)\b"), trigger_dva_link),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_add),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, admin_keyword_close),
+        ]
