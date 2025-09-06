@@ -1,129 +1,142 @@
+"""
+db.py - SQLite persistence for forms and deals
+"""
+
 import sqlite3
+import threading
 from typing import Optional, Dict, Any, List
 
-DB_PATH = "bot.db"
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+class DB:
+    def __init__(self, path: str = "escrow_bot.db"):
+        self.path = path
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.Lock()
+        self._create_tables()
 
-def init_db():
-    conn = get_conn()
-    c = conn.cursor()
-    
-    # Settings
-    c.execute("""CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    
-    # Deals
-    c.execute("""CREATE TABLE IF NOT EXISTS deals(
-        code TEXT PRIMARY KEY,
-        buyer TEXT,
-        seller TEXT,
-        amount REAL,
-        fee REAL,
-        admin_add TEXT,
-        admin_close TEXT,
-        ts_added INTEGER,
-        ts_closed INTEGER,
-        chat_id INTEGER,
-        msg_id INTEGER
-    )""")
-    
-    # Invite links
-    c.execute("""CREATE TABLE IF NOT EXISTS invite_links(
-        link TEXT PRIMARY KEY,
-        chat_id INTEGER,
-        user_id INTEGER,
-        ts INTEGER
-    )""")
-    
-    # Anti-scam seen usernames
-    c.execute("""CREATE TABLE IF NOT EXISTS seen_usernames(
-        chat_id INTEGER,
-        username TEXT,
-        skeleton TEXT,
-        ts INTEGER
-    )""")
-    
-    # Global ban
-    c.execute("""CREATE TABLE IF NOT EXISTS gbans(
-        user_id INTEGER PRIMARY KEY
-    )""")
-    
-    conn.commit()
-    conn.close()
+    def _create_tables(self):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS forms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER,
+                    message_id INTEGER,
+                    form_type TEXT,
+                    buyer TEXT,
+                    seller TEXT,
+                    amount REAL,
+                    purpose TEXT,
+                    filler_id INTEGER,
+                    filler_username TEXT,
+                    created_at TEXT,
+                    status TEXT DEFAULT 'pending',
+                    accepted_by_id INTEGER,
+                    accepted_by_username TEXT,
+                    accepted_at TEXT,
+                    deal_id INTEGER,
+                    closed_at TEXT
+                )
+                """
+            )
 
-# ------------------ Settings ------------------
-def set_setting(key: str, value: Any):
-    conn = get_conn()
-    conn.execute("REPLACE INTO settings(key,value) VALUES (?,?)", (key,str(value)))
-    conn.commit()
-    conn.close()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    form_id INTEGER,
+                    chat_id INTEGER,
+                    admin_id INTEGER,
+                    admin_username TEXT,
+                    status TEXT DEFAULT 'active',
+                    created_at TEXT,
+                    closed_at TEXT
+                )
+                """
+            )
+            self.conn.commit()
 
-def get_setting(key: str) -> Optional[str]:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
+    def create_form(self, chat_id: int, message_id: int, form_type: str, buyer: str, seller: str, amount: float, purpose: str, filler_id: int, filler_username: str, created_at: str) -> int:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO forms (chat_id, message_id, form_type, buyer, seller, amount, purpose, filler_id, filler_username, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (chat_id, message_id, form_type, buyer, seller, amount, purpose, filler_id, filler_username, created_at),
+            )
+            self.conn.commit()
+            return cur.lastrowid
 
-# ------------------ Deals ------------------
-def add_deal(code, buyer, seller, amount, fee, admin_add, ts_added, chat_id=None, msg_id=None):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO deals(code,buyer,seller,amount,fee,admin_add,ts_added,chat_id,msg_id) VALUES(?,?,?,?,?,?,?,?,?)",
-        (code,buyer,seller,amount,fee,admin_add,ts_added,chat_id,msg_id)
-    )
-    conn.commit()
-    conn.close()
+    def update_form_message_id(self, form_id: int, message_id: int):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE forms SET message_id = ? WHERE id = ?", (message_id, form_id))
+            self.conn.commit()
 
-def set_deal_message(code, chat_id, msg_id):
-    conn = get_conn()
-    conn.execute("UPDATE deals SET chat_id=?, msg_id=? WHERE code=?", (chat_id, msg_id, code))
-    conn.commit()
-    conn.close()
+    def get_form(self, form_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM forms WHERE id = ?", (form_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
-def mark_deal_closed(code, admin_close):
-    import time
-    conn = get_conn()
-    conn.execute("UPDATE deals SET admin_close=?, ts_closed=? WHERE code=?", (admin_close,int(time.time()),code))
-    conn.commit()
-    conn.close()
+    def get_form_by_message(self, chat_id: int, message_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM forms WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
-# ------------------ Invite links ------------------
-def add_invite_link(link, chat_id, user_id, ts):
-    conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO invite_links(link,chat_id,user_id,ts) VALUES(?,?,?,?)", (link,chat_id,user_id,ts))
-    conn.commit()
-    conn.close()
+    def update_form_accept(self, form_id: int, admin_id: int, admin_username: str, accepted_at: str, deal_id: int):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "UPDATE forms SET status = 'accepted', accepted_by_id = ?, accepted_by_username = ?, accepted_at = ?, deal_id = ? WHERE id = ?",
+                (admin_id, admin_username, accepted_at, deal_id, form_id),
+            )
+            self.conn.commit()
 
-# ------------------ Anti-scam ------------------
-def add_seen_username(chat_id, username, skeleton, ts):
-    conn = get_conn()
-    conn.execute("INSERT INTO seen_usernames(chat_id,username,skeleton,ts) VALUES(?,?,?,?)", (chat_id,username,skeleton,ts))
-    conn.commit()
-    conn.close()
+    def update_form_closed(self, form_id: int, closed_at: str):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE forms SET status = 'closed', closed_at = ? WHERE id = ?", (closed_at, form_id))
+            self.conn.commit()
 
-# ------------------ Global ban ------------------
-def is_gbanned(user_id: int) -> bool:
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM gbans WHERE user_id=?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return bool(result)
+    def add_deal(self, form_id: int, admin_id: int, admin_username: str, created_at: str) -> int:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT chat_id FROM forms WHERE id = ?", (form_id,))
+            row = cur.fetchone()
+            chat_id = row[0] if row else None
+            cur.execute("INSERT INTO deals (form_id, chat_id, admin_id, admin_username, created_at) VALUES (?,?,?,?,?)",
+                        (form_id, chat_id, admin_id, admin_username, created_at))
+            self.conn.commit()
+            return cur.lastrowid
 
-def gban_user(user_id: int):
-    conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO gbans(user_id) VALUES(?)", (user_id,))
-    conn.commit()
-    conn.close()
+    def get_deal_by_form(self, form_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM deals WHERE form_id = ?", (form_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
-def ungban_user(user_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM gbans WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+    def close_deal(self, deal_id: int, closed_at: str):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE deals SET status = 'closed', closed_at = ? WHERE id = ?", (closed_at, deal_id))
+            self.conn.commit()
+
+    def list_forms(self, chat_id: int) -> List[Dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM forms WHERE chat_id = ? AND status = 'pending'", (chat_id,))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+    def list_deals(self, chat_id: int) -> List[Dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM deals WHERE chat_id = ?", (chat_id,))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
