@@ -1,142 +1,138 @@
-"""
-db.py - SQLite persistence for forms and deals
+# db.py
+import aiosqlite
+import datetime
+from typing import Optional, List, Dict, Any
+
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS deals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deal_code TEXT UNIQUE,
+    seller_username TEXT,
+    buyer_username TEXT,
+    amount TEXT,
+    details TEXT,
+    source_chat_id INTEGER,
+    source_message_id INTEGER,
+    seller_user_id INTEGER,
+    buyer_user_id INTEGER,
+    seller_confirmed INTEGER DEFAULT 0,
+    buyer_confirmed INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending', -- pending, posted, closed
+    posted_message_id INTEGER,
+    posted_at TEXT,
+    added_by_admin_id INTEGER,
+    added_by_admin_username TEXT,
+    closed_by_admin_id INTEGER,
+    closed_by_admin_username TEXT,
+    closed_at TEXT,
+    kick_time TEXT,
+    kicked INTEGER DEFAULT 0,
+    created_at TEXT
+);
 """
 
-import sqlite3
-import threading
-from typing import Optional, Dict, Any, List
-from . import config as cfg
+def now_iso():
+    return datetime.datetime.utcnow().isoformat()
 
 class DB:
-    def __init__(self, path: str = "escrow_bot.db"):
-        self.path = path
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.lock = threading.Lock()
-        self._create_tables()
+    def __init__(self, db_path: str):
+        self.db_path = db_path
 
-    def _create_tables(self):
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS forms (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id INTEGER,
-                    message_id INTEGER,
-                    form_type TEXT,
-                    buyer TEXT,
-                    seller TEXT,
-                    amount REAL,
-                    purpose TEXT,
-                    filler_id INTEGER,
-                    filler_username TEXT,
-                    created_at TEXT,
-                    status TEXT DEFAULT 'pending',
-                    accepted_by_id INTEGER,
-                    accepted_by_username TEXT,
-                    accepted_at TEXT,
-                    deal_id INTEGER,
-                    closed_at TEXT
-                )
-                """
+    async def init(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(CREATE_TABLE_SQL)
+            await db.commit()
+
+    async def create_deal(self, seller_username: str, buyer_username: str, amount: str, details: str,
+                          source_chat_id: int, source_message_id: int) -> int:
+        created_at = now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT INTO deals (seller_username, buyer_username, amount, details, source_chat_id, source_message_id, created_at) VALUES (?,?,?,?,?,?,?)",
+                (seller_username, buyer_username, amount, details, source_chat_id, source_message_id, created_at)
             )
+            await db.commit()
+            rowid = cursor.lastrowid
+            deal_code = f"DVA{rowid}"
+            await db.execute("UPDATE deals SET deal_code = ? WHERE id = ?", (deal_code, rowid))
+            await db.commit()
+            return rowid
 
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS deals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    form_id INTEGER,
-                    chat_id INTEGER,
-                    admin_id INTEGER,
-                    admin_username TEXT,
-                    status TEXT DEFAULT 'active',
-                    created_at TEXT,
-                    closed_at TEXT
-                )
-                """
-            )
-            self.conn.commit()
-
-    def create_form(self, chat_id: int, message_id: int, form_type: str, buyer: str, seller: str, amount: float, purpose: str, filler_id: int, filler_username: str, created_at: str) -> int:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute(
-                "INSERT INTO forms (chat_id, message_id, form_type, buyer, seller, amount, purpose, filler_id, filler_username, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (chat_id, message_id, form_type, buyer, seller, amount, purpose, filler_id, filler_username, created_at),
-            )
-            self.conn.commit()
-            return cur.lastrowid
-
-    def update_form_message_id(self, form_id: int, message_id: int):
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("UPDATE forms SET message_id = ? WHERE id = ?", (message_id, form_id))
-            self.conn.commit()
-
-    def get_form(self, form_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM forms WHERE id = ?", (form_id,))
-            row = cur.fetchone()
+    async def get_deal(self, by_id: Optional[int] = None, by_code: Optional[str] = None) -> Optional[dict]:
+        q, params = None, None
+        if by_id:
+            q = "SELECT * FROM deals WHERE id = ?"
+            params = (by_id,)
+        elif by_code:
+            q = "SELECT * FROM deals WHERE deal_code = ?"
+            params = (by_code,)
+        else:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(q, params)
+            row = await cur.fetchone()
             return dict(row) if row else None
 
-    def get_form_by_message(self, chat_id: int, message_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM forms WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-    def update_form_accept(self, form_id: int, admin_id: int, admin_username: str, accepted_at: str, deal_id: int):
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute(
-                "UPDATE forms SET status = 'accepted', accepted_by_id = ?, accepted_by_username = ?, accepted_at = ?, deal_id = ? WHERE id = ?",
-                (admin_id, admin_username, accepted_at, deal_id, form_id),
+    async def confirm_user(self, deal_id: int, role: str, user_id: int, username: str):
+        if role not in ("buyer", "seller"):
+            return
+        col_user_id = f"{role}_user_id"
+        col_confirm = f"{role}_confirmed"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                f"UPDATE deals SET {col_user_id} = ?, {col_confirm} = 1 WHERE id = ?",
+                (user_id, deal_id)
             )
-            self.conn.commit()
+            await db.commit()
 
-    def update_form_closed(self, form_id: int, closed_at: str):
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("UPDATE forms SET status = 'closed', closed_at = ? WHERE id = ?", (closed_at, form_id))
-            self.conn.commit()
+    async def set_posted(self, deal_id: int, posted_message_id: int):
+        posted_at = now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE deals SET status = 'posted', posted_message_id = ?, posted_at = ? WHERE id = ?",
+                (posted_message_id, posted_at, deal_id)
+            )
+            await db.commit()
 
-    def add_deal(self, form_id: int, admin_id: int, admin_username: str, created_at: str) -> int:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT chat_id FROM forms WHERE id = ?", (form_id,))
-            row = cur.fetchone()
-            chat_id = row[0] if row else None
-            cur.execute("INSERT INTO deals (form_id, chat_id, admin_id, admin_username, created_at) VALUES (?,?,?,?,?)",
-                        (form_id, chat_id, admin_id, admin_username, created_at))
-            self.conn.commit()
-            return cur.lastrowid
+    async def set_added_by(self, deal_id: int, admin_id: int, admin_username: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE deals SET added_by_admin_id = ?, added_by_admin_username = ? WHERE id = ?",
+                (admin_id, admin_username, deal_id)
+            )
+            await db.commit()
 
-    def get_deal_by_form(self, form_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM deals WHERE form_id = ?", (form_id,))
-            row = cur.fetchone()
-            return dict(row) if row else None
+    async def set_closed(self, deal_id: int, admin_id: int, admin_username: str):
+        closed_at = now_iso()
+        kick_time = (datetime.datetime.utcnow() + datetime.timedelta(minutes=15)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE deals SET status = 'closed', closed_by_admin_id = ?, closed_by_admin_username = ?, closed_at = ?, kick_time = ? WHERE id = ?",
+                (admin_id, admin_username, closed_at, kick_time, deal_id)
+            )
+            await db.commit()
+        return kick_time
 
-    def close_deal(self, deal_id: int, closed_at: str):
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("UPDATE deals SET status = 'closed', closed_at = ? WHERE id = ?", (closed_at, deal_id))
-            self.conn.commit()
-
-    def list_forms(self, chat_id: int) -> List[Dict[str, Any]]:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM forms WHERE chat_id = ? AND status = 'pending'", (chat_id,))
-            rows = cur.fetchall()
+    async def get_pending_kicks(self) -> List[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM deals WHERE status = 'closed' AND kicked = 0 AND kick_time IS NOT NULL"
+            )
+            rows = await cur.fetchall()
             return [dict(r) for r in rows]
 
-    def list_deals(self, chat_id: int) -> List[Dict[str, Any]]:
-        with self.lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM deals WHERE chat_id = ?", (chat_id,))
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
+    async def mark_kicked(self, deal_id: int):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE deals SET kicked = 1 WHERE id = ?", (deal_id,))
+            await db.commit()
+
+    async def both_confirmed(self, deal_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT buyer_confirmed, seller_confirmed FROM deals WHERE id = ?", (deal_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            return bool(row["buyer_confirmed"]) and bool(row["seller_confirmed"])
