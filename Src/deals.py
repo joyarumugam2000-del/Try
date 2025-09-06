@@ -2,7 +2,7 @@
 deals.py - formatting helpers for posts
 """
 
-from utils import shorten_username
+from .utils import shorten_username
 
 
 def format_money(amount: float) -> str:
