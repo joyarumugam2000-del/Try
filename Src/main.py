@@ -16,10 +16,11 @@ from telegram.ext import (
     filters,
 )
 
-import config as cfg
-from db import DB
-import utils
-import deals
+# ✅ Use relative imports since this file is inside the Src package
+from . import config as cfg
+from .db import DB
+from . import utils
+from . import deals
 
 # conversation states
 (T_FORM_TYPE, T_BUYER, T_SELLER, T_AMOUNT, T_PURPOSE, T_CONFIRM) = range(6)
