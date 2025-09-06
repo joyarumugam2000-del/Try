@@ -5,7 +5,7 @@ db.py - SQLite persistence for forms and deals
 import sqlite3
 import threading
 from typing import Optional, Dict, Any, List
-
+from . import config as cfg
 
 class DB:
     def __init__(self, path: str = "escrow_bot.db"):
