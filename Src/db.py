@@ -1,4 +1,3 @@
-# db.py
 import aiosqlite
 from datetime import datetime, timedelta
 from typing import Optional
@@ -32,7 +31,7 @@ CREATE TABLE IF NOT EXISTS deals (
 """
 
 def now_iso():
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.utcnow().isoformat()
 
 class DB:
     def __init__(self, db_path: str):
@@ -105,7 +104,7 @@ class DB:
 
     async def set_closed(self, deal_id: int, admin_id: int, admin_username: str):
         closed_at = now_iso()
-        kick_time = (datetime.datetime.utcnow() + datetime.timedelta(minutes=15)).isoformat()
+        kick_time = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 "UPDATE deals SET status = 'closed', closed_by_admin_id = ?, closed_by_admin_username = ?, closed_at = ?, kick_time = ? WHERE id = ?",
@@ -114,7 +113,7 @@ class DB:
             await db.commit()
         return kick_time
 
-    async def get_pending_kicks(self) -> List[dict]:
+    async def get_pending_kicks(self) -> list[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
