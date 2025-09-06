@@ -1,54 +1,86 @@
-"""
-deals.py - formatting helpers for posts
-"""
+from telegram import Update
+from telegram.ext import ContextTypes
+from datetime import datetime
+from . import config as cfg
+from .db import DB
+import re
 
-from .utils import shorten_username
+db = DB(cfg.DB_PATH)
 
+# ---------------------------
+# /add command: start a deal
+# ---------------------------
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    admin_id = user.id
 
-def format_money(amount: float) -> str:
-    try:
-        return f"${amount:,.2f}"
-    except Exception:
-        return str(amount)
+    # Check if replied to a message
+    if update.message.reply_to_message:
+        text = update.message.reply_to_message.text
+    elif context.args:
+        deal_id = context.args[0]
+        text = db.get_form_by_id(deal_id)
+        if not text:
+            await update.message.reply_text("❌ No form found with that ID.")
+            return
+    else:
+        await update.message.reply_text("❌ Reply to a form message or provide deal ID.")
+        return
 
+    # Extract details from form (simple regex, adjust as needed)
+    match = re.search(r"✅👤 BUYER: (@\S+)\s+SELLER: (@\S+)\s+AMOUNT: (\d+)", text)
+    if not match:
+        await update.message.reply_text("❌ Invalid form format.")
+        return
 
-def format_form_preview(form_type: str, buyer: str, seller: str, amount: float, purpose: str, posted_by: str, created_at: str) -> str:
-    return (
-        f"Preview — {form_type}\n"
-        f"BUYER: {buyer}\n"
+    buyer, seller, amount = match.groups()
+    deal_id = db.add_deal(buyer, seller, amount, admin_id, status="IN_PROGRESS")
+    timestamp = datetime.utcnow().strftime(cfg.TIME_FORMAT)
+
+    await update.message.reply_text(
+        f"✅ ESCROW STARTED\n"
+        f"✅👤 BUYER: {buyer}\n"
         f"SELLER: {seller}\n"
-        f"AMOUNT: {format_money(amount)}\n"
-        f"Purpose: {purpose}\n"
-        f"Posted by: @{posted_by} at {created_at}"
+        f"AMOUNT: ${amount}\n"
+        f"STARTED BY: {user.mention_html()}\n"
+        f"ID: {deal_id}-{timestamp}",
+        parse_mode="HTML"
     )
 
+# ---------------------------
+# /close command: finish a deal
+# ---------------------------
+async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    admin_id = user.id
 
-def format_form_post(form_id: int, form_type: str, buyer: str, seller: str, amount: float, purpose: str, filler_username: str, created_at: str) -> str:
-    return (
-        f"✅ {form_type}\n"
-        f"👤 BUYER: {buyer}\n"
-        f"🔗 SELLER: {seller}\n"
-        f"💰 AMOUNT: {format_money(amount)}\n"
-        f"📝 Purpose: {purpose}\n"
-        f"🧾 Form ID: {form_id} — posted by @{filler_username} at {created_at}"
-    )
+    # Check if replied to a message
+    if update.message.reply_to_message:
+        text = update.message.reply_to_message.text
+    elif context.args:
+        deal_id = context.args[0]
+        text = db.get_form_by_id(deal_id)
+        if not text:
+            await update.message.reply_text("❌ No deal found with that ID.")
+            return
+    else:
+        await update.message.reply_text("❌ Reply to a deal message or provide deal ID.")
+        return
 
+    deal = db.get_deal_by_text(text)
+    if not deal:
+        await update.message.reply_text("❌ Could not find a deal associated with this form/message.")
+        return
 
-def format_deal_added(form_id: int, buyer: str, seller: str, amount: float, admin_username: str, deal_id: int, accepted_at: str) -> str:
-    return (
-        f"✅ DEAL ACCEPTED — Form ID {form_id}\n"
-        f"👤 BUYER: {buyer}\n"
-        f"🔗 SELLER: {seller}\n"
-        f"💰 AMOUNT: {format_money(amount)}\n"
-        f"🛡️ ACCEPTED BY: @{admin_username}\n"
-        f"🆔 Deal ID: {deal_id} — at {accepted_at}"
-    )
+    db.update_deal_status(deal['id'], "COMPLETED", released_by=admin_id)
+    timestamp = datetime.utcnow().strftime(cfg.TIME_FORMAT)
 
-
-def format_deal_closed(form_id: int, buyer: str, seller: str, amount: float, admin_username: str, deal_id: int, closed_at: str) -> str:
-    # Use shortened usernames to mimic your example like @T...x
-    return (
-        f"✅ ESCROW DONE ✅\n"
-        f"👤 BUYER: {shorten_username(buyer)} 🔗 SELLER: {shorten_username(seller)} 💰 RELEASED AMOUNT: {format_money(amount)}\n"
-        f"🛡️ RELEASED BY: @{admin_username} | ID: {deal_id} - {closed_at}"
-    )
+    await update.message.reply_text(
+        f"✅ ESCROW DONE\n"
+        f"✅👤 BUYER: {deal['buyer']} 🔗\n"
+        f"SELLER: {deal['seller']} 💰\n"
+        f"RELEASED AMOUNT: ${deal['amount']}\n"
+        f"🛡️ RELEASED BY: {user.mention_html()}\n"
+        f"ID: {deal['id']}-{timestamp}",
+        parse_mode="HTML"
+            )
