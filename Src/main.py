@@ -1,207 +1,54 @@
-# main.py
-import os
-import asyncio
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    CommandHandler,
-)
-from Src.utils import parse_form_text, fmt_time_india, now_iso
-from Src.db import DB
-import logging
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update
+from config import BOT_TOKEN, ADMIN_IDS
+from deals import post_deal, start_deal, cancel_deal
+from seller import join_deal_seller
+from buyer import join_deal_buyer
 
-# Load environment
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send your deal form:\nSeller: @username\nBuyer: @username\nAmount: 100\nMore details: optional")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DVA_GROUP_ID = int(os.getenv("DVA_GROUP_ID"))
-DVA_INVITE_LINK = os.getenv("DVA_INVITE_LINK")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
-DB_PATH = os.getenv("DB_PATH", "./dva.db")
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "20"))
-
-db = DB(DB_PATH)
-
-# ----- Logging helper -----
-async def log_to_channel(app, text: str):
+async def submit_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await app.bot.send_message(LOG_CHANNEL_ID, text)
+        msg = update.message.text.split('\n')
+        if len(msg) < 3:
+            await update.message.reply_text("Form invalid! Must include Seller, Buyer, Amount.")
+            return
+        seller = msg[0].split(':')[1].strip().replace('@','')
+        buyer = msg[1].split(':')[1].strip().replace('@','')
+        amount = int(msg[2].split(':')[1].strip())
+        details = msg[3].split(':')[1].strip() if len(msg) > 3 else ""
+        deal_id = await post_deal(context.bot, seller, buyer, amount, details)
+        await update.message.reply_text(f"Deal submitted! Pending in DVA group with ID: {deal_id}")
     except Exception as e:
-        logger.error("Failed to send log: %s", e)
+        await update.message.reply_text(f"Error processing form: {e}")
 
-# ----- Regex for deal form -----
-DEAL_FORM_REGEX = r"(?i)^@admins\s*\n\s*Seller:\s*@\w+\s*\n\s*Buyer:\s*@\w+\s*\n\s*Amount:\s*\d+(\.\d+)?"
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split('_')
+    action = data[0]
+    deal_id = data[1]
+    user_id = query.from_user.id
 
-# ----- Handle deal form in group -----
-async def handle_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_chat:
-        return
-    text = update.message.text
-    parsed = parse_form_text(text)
-    if not parsed:
-        return
+    if action == "join":
+        joined_seller = await join_deal_seller(user_id, deal_id)
+        joined_buyer = await join_deal_buyer(user_id, deal_id)
+        if joined_seller or joined_buyer:
+            await query.reply_text("Joined the deal successfully!")
+        else:
+            await query.reply_text("You are not part of this deal.")
+    elif action == "start" and user_id in ADMIN_IDS:
+        res = await start_deal(context.bot, deal_id)
+        await query.reply_text(res)
+    elif action == "cancel" and user_id in ADMIN_IDS:
+        res = await cancel_deal(context.bot, deal_id)
+        await query.reply_text(res)
+    else:
+        await query.reply_text("You are not authorized to perform this action.")
 
-    seller = parsed["seller"]
-    buyer = parsed["buyer"]
-    amount = parsed["amount"]
-    details = parsed["details"]
-    source_chat_id = update.effective_chat.id
-    source_message_id = update.message.message_id
-
-    # Create deal in DB
-    deal_row_id = await db.create_deal(seller, buyer, amount, details, source_chat_id, source_message_id)
-    deal_code = f"DVA{deal_row_id}"
-
-    bot_username = (await context.bot.get_me()).username
-    buyer_start = f"https://t.me/{bot_username}?start=join:{deal_row_id}:buyer"
-    seller_start = f"https://t.me/{bot_username}?start=join:{deal_row_id}:seller"
-
-    text_reply = (
-        f"📌 Deal registered (temporary): {deal_code}\n"
-        f"Seller: @{seller}\nBuyer: @{buyer}\nAmount: {amount}\n\n"
-        "Buyer & Seller — click your respective button below to verify with the bot and receive the DVA group invite link."
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="I'm Buyer — Join", url=buyer_start),
-         InlineKeyboardButton(text="I'm Seller — Join", url=seller_start)]
-    ])
-    await update.message.reply_text(text_reply, reply_markup=kb)
-    await log_to_channel(context.application, f"[{now_iso()}] New form parsed: {deal_code} seller=@{seller} buyer=@{buyer} amount={amount} details={details}")
-
-# ----- /start handler for deep links -----
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text or ""
-    parts = text.split()
-    payload = parts[1] if len(parts) >= 2 else ""
-
-    if not payload:
-        await update.message.reply_text("Welcome to DVA bot. This bot handles deal flows for DVA groups only.")
-        return
-
-    try:
-        tokens = payload.split(":")
-        if len(tokens) != 3 or tokens[0] != "join":
-            raise ValueError("invalid payload")
-        deal_id = int(tokens[1])
-        role = tokens[2]
-    except Exception:
-        await update.message.reply_text("Invalid start payload.")
-        return
-
-    deal = await db.get_deal(by_id=deal_id)
-    if not deal:
-        await update.message.reply_text("Deal not found or expired.")
-        return
-
-    expected_username = deal["buyer_username"] if role == "buyer" else deal["seller_username"]
-    actual_username = user.username
-    if not actual_username:
-        await update.message.reply_text("Set a Telegram username first (@username) and click the button again.")
-        return
-
-    if actual_username.lower() != expected_username.lower():
-        await update.message.reply_text(
-            f"Your @username is @{actual_username} but the deal expects @{expected_username}."
-        )
-        await log_to_channel(context.application, f"[{now_iso()}] @{actual_username} attempted to claim role {role} for deal {deal['deal_code']}")
-        return
-
-    await db.confirm_user(deal_id, role, user.id, actual_username)
-    await update.message.reply_text(
-        f"Thanks @{actual_username}! You are verified as the {role} for deal {deal['deal_code']}.\n"
-        f"Here is the invite link to join the DVA group:\n{DVA_INVITE_LINK}"
-    )
-    await log_to_channel(context.application, f"[{now_iso()}] @{actual_username} confirmed as {role} for {deal['deal_code']}")
-
-    # Check if both confirmed to post deal
-    both_confirmed = await db.both_confirmed(deal_id)
-    if both_confirmed:
-        updated = await db.get_deal(by_id=deal_id)
-        buyer_id = updated.get("buyer_user_id")
-        seller_id = updated.get("seller_user_id")
-        if buyer_id and seller_id:
-            try:
-                buyer_status = await context.bot.get_chat_member(DVA_GROUP_ID, buyer_id)
-                seller_status = await context.bot.get_chat_member(DVA_GROUP_ID, seller_id)
-                if buyer_status.status in ("member", "administrator", "creator") and seller_status.status in ("member", "administrator", "creator"):
-                    await post_deal_to_dva(context, deal_id)
-            except Exception:
-                pass
-
-# ----- Post deal in DVA group -----
-async def post_deal_to_dva(context: ContextTypes.DEFAULT_TYPE, deal_id: int):
-    app = context.application
-    deal = await db.get_deal(by_id=deal_id)
-    if not deal or deal.get("status") == "posted":
-        return
-
-    posted_text = (
-        f"🤝 Deal Info\n"
-        f"💰 Received: {deal['amount']}\n"
-        f"🆔 Deal ID: {deal['deal_code']}\n"
-        f"ℹ️ Details: {deal['details'] or '—'}\n\n"
-        f"👤 Buyer: @{deal['buyer_username']}\n"
-        f"👨‍💼 Seller: @{deal['seller_username']}\n"
-        f"🔐 DVA admin By: (pending admin add)\n"
-        f"\n⏰ Created: {fmt_time_india(deal['created_at'])}"
-    )
-    sent = await app.bot.send_message(DVA_GROUP_ID, posted_text)
-    await db.set_posted(deal_id, sent.message_id)
-    await log_to_channel(app, f"[{now_iso()}] Deal posted: {deal['deal_code']}")
-
-# ----- Main function -----
-def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Init DB
-    asyncio.get_event_loop().run_until_complete(db.init())
-
-    # Handlers
-    application.add_handler(MessageHandler(
-        filters.ChatType.GROUP & filters.TEXT & filters.Regex(DEAL_FORM_REGEX),
-        handle_group_form
-    ))
-    application.add_handler(CommandHandler("start", start_handler))
-    # You can add /adddeal, /close, new member handlers here as before
-
-    # Background kick worker
-    async def on_startup(app):
-        async def kick_worker(app):
-            while True:
-                try:
-                    pending = await db.get_pending_kicks()
-                    import datetime
-                    now = datetime.utcnow()
-                    for d in pending:
-                        if not d.get("kick_time"):
-                            continue
-                        kt = datetime.fromisoformat(d["kick_time"])
-                        if now >= kt and d.get("kicked") == 0:
-                            for uid in (d.get("buyer_user_id"), d.get("seller_user_id")):
-                                if not uid:
-                                    continue
-                                try:
-                                    await app.bot.ban_chat_member(DVA_GROUP_ID, uid)
-                                    await app.bot.unban_chat_member(DVA_GROUP_ID, uid)
-                                except Exception as e:
-                                    logger.warning("Failed to kick user %s: %s", uid, e)
-                            await db.mark_kicked(d["id"])
-                            await log_to_channel(app, f"[{now_iso()}] Kicked participants of deal {d['deal_code']}")
-                except Exception as e:
-                    logger.error("Kick worker error: %s", e)
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-        app.create_task(kick_worker(app))
-
-    application.post_init = on_startup
-    logger.info("Starting DVA bot...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), submit_form))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.run_polling()
