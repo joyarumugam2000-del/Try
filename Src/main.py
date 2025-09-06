@@ -1,362 +1,353 @@
-"""
-main.py - Telegram Escrow/DVA Group Bot
-Requires python-telegram-bot v20+
-"""
-
+# main.py
+import os
+import asyncio
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
+from utils import parse_form_text, fmt_time_india, now_iso
+from db import DB
 import logging
-import traceback
 
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
-
-# ✅ Use relative imports since this file is inside the Src package
-from . import config as cfg
-from .db import DB
-from . import utils
-from . import deals
-
-# conversation states
-(T_FORM_TYPE, T_BUYER, T_SELLER, T_AMOUNT, T_PURPOSE, T_CONFIRM) = range(6)
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-db = DB(cfg.DB_PATH)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DVA_GROUP_ID = int(os.getenv("DVA_GROUP_ID"))
+DVA_INVITE_LINK = os.getenv("DVA_INVITE_LINK")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
+DB_PATH = os.getenv("DB_PATH", "./dva.db")
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "20"))
 
+db = DB(DB_PATH)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hi! Use /form in a group to create an ESCROW or DVA form. (Bot works in groups only.)"
-    )
-
-
-# ---------- FORM CONVERSATION ----------
-async def form_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("/form works in groups only. Add me to a group and try again.")
-        return ConversationHandler.END
-
-    await update.message.reply_text("Starting form. Reply with the type: ESCROW or DVA")
-    return T_FORM_TYPE
-
-
-async def form_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().upper()
-    if text not in ("ESCROW", "DVA"):
-        await update.message.reply_text("Please send either ESCROW or DVA.")
-        return T_FORM_TYPE
-    context.user_data["form_type"] = text
-    await update.message.reply_text("Send BUYER username (start with @). Example: @buyerusername")
-    return T_BUYER
-
-
-async def form_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buyer = update.message.text.strip()
-    if not buyer.startswith("@"):
-        await update.message.reply_text("Buyer username must start with @. Try again.")
-        return T_BUYER
-    context.user_data["buyer"] = buyer
-    await update.message.reply_text("Send SELLER username (start with @). Example: @sellerusername")
-    return T_SELLER
-
-
-async def form_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    seller = update.message.text.strip()
-    if not seller.startswith("@"):
-        await update.message.reply_text("Seller username must start with @. Try again.")
-        return T_SELLER
-    context.user_data["seller"] = seller
-    await update.message.reply_text("Send AMOUNT (integer or decimal). Example: 99 or 99.50")
-    return T_AMOUNT
-
-
-async def form_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    amount_text = update.message.text.strip().replace(",", "")
+async def log_to_channel(app, text: str):
     try:
-        amount = float(amount_text)
-        if amount <= 0:
-            raise ValueError()
+        await app.bot.send_message(LOG_CHANNEL_ID, text)
+    except Exception as e:
+        logger.error("Failed to send log: %s", e)
+
+async def handle_group_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # parse only group messages that look like form
+    if not update.message or not update.effective_chat:
+        return
+    text = update.message.text
+    parsed = parse_form_text(text)
+    if not parsed:
+        return
+    # create deal in DB
+    seller = parsed["seller"]
+    buyer = parsed["buyer"]
+    amount = parsed["amount"]
+    details = parsed["details"]
+    source_chat_id = update.effective_chat.id
+    source_message_id = update.message.message_id
+    deal_row_id = await db.create_deal(seller, buyer, amount, details, source_chat_id, source_message_id)
+    deal_code = f"DVA{deal_row_id}"
+
+    # deep links for buyer & seller
+    bot_username = (await context.bot.get_me()).username
+    # start payload: join:<deal_id>:role  — note: Telegram will URL encode automatically
+    buyer_start = f"https://t.me/{bot_username}?start=join:{deal_row_id}:buyer"
+    seller_start = f"https://t.me/{bot_username}?start=join:{deal_row_id}:seller"
+
+    text_reply = (
+        f"📌 Deal registered (temporary): {deal_code}\n"
+        f"Seller: @{seller}\nBuyer: @{buyer}\nAmount: {amount}\n\n"
+        "Buyer & Seller — please click the appropriate button below to verify your username privately with the bot and receive the invite link to the DVA group."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="I'm Buyer — Join", url=buyer_start),
+         InlineKeyboardButton(text="I'm Seller — Join", url=seller_start)]
+    ])
+    await update.message.reply_text(text_reply, reply_markup=kb)
+    await log_to_channel(context.application, f"[{now_iso()}] New form parsed: {deal_code} seller=@{seller} buyer=@{buyer} amount={amount} details={details}")
+
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles /start deep links like:
+    /start join:<deal_id>:buyer
+    """
+    user = update.effective_user
+    text = update.message.text or ""
+    parts = text.split()
+    payload = parts[1] if len(parts) >= 2 else ""
+    if not payload:
+        await update.message.reply_text("Welcome to DVA bot. This bot only handles deal flows for DVA groups.")
+        return
+    # parse expected payload
+    try:
+        # payload format: join:123:buyer
+        tokens = payload.split(":")
+        if len(tokens) != 3 or tokens[0] != "join":
+            raise ValueError("invalid payload")
+        deal_id = int(tokens[1])
+        role = tokens[2]
     except Exception:
-        await update.message.reply_text("Invalid amount. Send a positive number. Example: 99 or 99.50")
-        return T_AMOUNT
-    context.user_data["amount"] = amount
-    await update.message.reply_text("Send Purpose / short description of the deal.")
-    return T_PURPOSE
-
-
-async def form_purpose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    purpose = update.message.text.strip()
-    context.user_data["purpose"] = purpose
-
-    preview = deals.format_form_preview(
-        form_type=context.user_data["form_type"],
-        buyer=context.user_data["buyer"],
-        seller=context.user_data["seller"],
-        amount=context.user_data["amount"],
-        purpose=context.user_data["purpose"],
-        posted_by=getattr(update.effective_user, "username", str(update.effective_user.id)),
-        created_at=utils.now_iso(),
-    )
-
-    await update.message.reply_text(preview + "\n\nReply YES to save and post the form, or NO to cancel.")
-    return T_CONFIRM
-
-
-async def form_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    if text not in ("yes", "y"):
-        await update.message.reply_text("Form cancelled.")
-        return ConversationHandler.END
-
-    chat = update.effective_chat
-    user = update.effective_user
-
-    created_at = utils.now_iso()
-    # Create form record
-    form_id = db.create_form(
-        chat_id=chat.id,
-        message_id=0,
-        form_type=context.user_data["form_type"],
-        buyer=context.user_data["buyer"],
-        seller=context.user_data["seller"],
-        amount=context.user_data["amount"],
-        purpose=context.user_data["purpose"],
-        filler_id=user.id,
-        filler_username=getattr(user, "username", str(user.id)),
-        created_at=created_at,
-    )
-
-    # Post visible form message
-    post_text = deals.format_form_post(
-        form_id=form_id,
-        form_type=context.user_data["form_type"],
-        buyer=context.user_data["buyer"],
-        seller=context.user_data["seller"],
-        amount=context.user_data["amount"],
-        purpose=context.user_data["purpose"],
-        filler_username=getattr(user, "username", str(user.id)),
-        created_at=created_at,
-    )
-
-    posted = await update.message.reply_text(post_text)
-    db.update_form_message_id(form_id, posted.message_id)
-
-    # Log
-    try:
-        if cfg.LOG_CHANNEL_ID:
-            await context.bot.send_message(cfg.LOG_CHANNEL_ID, f"[FORM CREATED]\n{post_text}")
-    except Exception as e:
-        logger.warning("Failed to post to log channel: %s", e)
-
-    await update.message.reply_text(f"Form saved with ID {form_id}. An admin can /add {form_id} to accept the deal.")
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Form cancelled.")
-    return ConversationHandler.END
-
-
-# ---------- ADMIN COMMANDS ----------
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("/add can be used in groups only.")
+        await update.message.reply_text("Invalid start payload.")
         return
 
-    is_admin = await utils.is_user_admin(context.bot, chat.id, user.id)
-    if not is_admin:
-        await update.message.reply_text("Only group admins can accept deals (use /add <form_id>).")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /add <form_id>")
-        return
-
-    try:
-        form_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("Form id must be a number. Usage: /add <form_id>")
-        return
-
-    form = db.get_form(form_id)
-    if not form:
-        await update.message.reply_text(f"Form id {form_id} not found.")
-        return
-
-    if form["status"] != "pending":
-        await update.message.reply_text(f"Form {form_id} is not pending (status: {form['status']}).")
-        return
-
-    # Create deal
-    created_at = utils.now_iso()
-    deal_id = db.add_deal(form_id=form_id, admin_id=user.id, admin_username=getattr(user, "username", str(user.id)), created_at=created_at)
-
-    db.update_form_accept(form_id=form_id, admin_id=user.id, admin_username=getattr(user, "username", str(user.id)), accepted_at=created_at, deal_id=deal_id)
-
-    add_text = deals.format_deal_added(
-        form_id=form_id,
-        buyer=form["buyer"],
-        seller=form["seller"],
-        amount=form["amount"],
-        admin_username=getattr(user, "username", str(user.id)),
-        deal_id=deal_id,
-        accepted_at=created_at,
-    )
-
-    await update.message.reply_text(add_text)
-
-    try:
-        if cfg.LOG_CHANNEL_ID:
-            await context.bot.send_message(cfg.LOG_CHANNEL_ID, f"[DEAL ADDED]\n{add_text}")
-    except Exception as e:
-        logger.warning("Failed to post to log channel: %s", e)
-
-
-async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("/close works in groups only. Reply to the form message with /close.")
-        return
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text("To close a deal, reply to the original form message with /close.")
-        return
-
-    replied_msg = update.message.reply_to_message
-    form = db.get_form_by_message(chat.id, replied_msg.message_id)
-    if not form:
-        await update.message.reply_text("Could not find a form associated with the replied message.")
-        return
-
-    deal = db.get_deal_by_form(form_id=form["id"]) if form else None
+    deal = await db.get_deal(by_id=deal_id)
     if not deal:
-        await update.message.reply_text("No active deal found for this form. Maybe it was never accepted.")
+        await update.message.reply_text("Deal not found or expired.")
         return
 
-    if deal["admin_id"] != user.id:
-        await update.message.reply_text("Only the admin who accepted/added this deal can close it.")
+    expected_username = deal[f"{role}_username"] if f"{role}_username" in deal else deal[f"{role}_username"]
+    # db fields are buyer_username / seller_username
+    expected_username = deal["buyer_username"] if role == "buyer" else deal["seller_username"]
+
+    # Ensure user has a username
+    actual_username = user.username
+    if not actual_username:
+        await update.message.reply_text("You don't have a Telegram username set. Set a username first (@username) and click the button again.")
         return
 
-    closed_at = utils.now_iso()
-    db.close_deal(deal_id=deal["id"], closed_at=closed_at)
-    db.update_form_closed(form_id=form["id"], closed_at=closed_at)
+    if actual_username.lower() != expected_username.lower():
+        await update.message.reply_text(
+            f"Your @username is @{actual_username} but the deal expects @{expected_username}.\n"
+            "If you control that username, change it to match, or ask the person who posted to correct the username."
+        )
+        await log_to_channel(context.application, f"[{now_iso()}] User @{actual_username} attempted to claim role {role} for deal {deal['deal_code']} (expected @{expected_username})")
+        return
 
-    closed_text = deals.format_deal_closed(
-        form_id=form["id"],
-        buyer=form["buyer"],
-        seller=form["seller"],
-        amount=form["amount"],
-        admin_username=deal["admin_username"],
-        deal_id=deal["id"],
-        closed_at=closed_at,
+    # Mark confirmed
+    await db.confirm_user(deal_id, role, user.id, actual_username)
+    await update.message.reply_text(f"Thanks @{actual_username}! You are verified as the {role} for deal {deal['deal_code']} — here's the invite link to join the DVA group:\n\n{DVA_INVITE_LINK}\n\nAfter both parties join, the deal will be posted in the DVA group.")
+    await log_to_channel(context.application, f"[{now_iso()}] @{actual_username} confirmed as {role} for {deal['deal_code']}")
+
+    # If both confirmed and both are members (or can be checked), we will post once we detect both in DVA group.
+    both_confirmed = await db.both_confirmed(deal_id)
+    if both_confirmed:
+        # check membership of both in DVA group
+        buyer_id = deal.get("buyer_user_id")
+        seller_id = deal.get("seller_user_id")
+        # get the latest deal to obtain user ids that may have been updated by confirm_user
+        updated = await db.get_deal(by_id=deal_id)
+        buyer_id = updated.get("buyer_user_id")
+        seller_id = updated.get("seller_user_id")
+        if buyer_id and seller_id:
+            # check chat member statuses
+            try:
+                buyer_status = await context.bot.get_chat_member(DVA_GROUP_ID, buyer_id)
+                seller_status = await context.bot.get_chat_member(DVA_GROUP_ID, seller_id)
+                buyer_in = buyer_status.status in ("member", "administrator", "creator")
+                seller_in = seller_status.status in ("member", "administrator", "creator")
+            except Exception:
+                buyer_in = seller_in = False
+            if buyer_in and seller_in:
+                await post_deal_to_dva(context, deal_id)
+
+async def post_deal_to_dva(context: ContextTypes.DEFAULT_TYPE, deal_id: int):
+    app = context.application
+    deal = await db.get_deal(by_id=deal_id)
+    if not deal:
+        return
+    if deal.get("status") == "posted":
+        return
+    deal_code = deal["deal_code"]
+    amount = deal["amount"]
+    details = deal["details"] or "—"
+    buyer = deal["buyer_username"]
+    seller = deal["seller_username"]
+    posted_text = (
+        f"🤝 Deal Info\n"
+        f"💰 Received: {amount}\n"
+        f"🆔 Deal ID: {deal_code}\n"
+        f"ℹ️ Details: {details}\n\n"
+        f"👤 Buyer: @{buyer}\n"
+        f"👨‍💼 Seller: @{seller}\n"
+        f"🔐 DVA admin By: (pending admin add; admin use /adddeal to register)\n"
+        f"\n⏰ Created: {fmt_time_india(deal['created_at'])}"
     )
+    sent = await app.bot.send_message(DVA_GROUP_ID, posted_text)
+    await db.set_posted(deal_id, sent.message_id)
+    await log_to_channel(app, f"[{now_iso()}] Deal posted in DVA group: {deal_code} buyer=@{buyer} seller=@{seller} amount={amount}")
 
-    await update.message.reply_text(closed_text)
+async def handle_new_members_in_dva(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Triggered when new_chat_members join a chat — we check whether they are joining DVA group and if there are pending deals waiting for them
+    if not update.message or not update.message.new_chat_members:
+        return
+    chat = update.effective_chat
+    if chat.id != DVA_GROUP_ID:
+        return
+    joined_ids = [m.id for m in update.message.new_chat_members]
+    # fetch closed/pending deals that might be waiting for a join
+    # logic: check all pending deals where both confirmed but not posted, and one of joined user IDs equals these.
+    # We'll scan recent deals (simple approach)
+    # For simplicity: every time a user joins DVA group we check all deals where status != posted and both confirmed are true.
+    # If both parties are now present, post the deal.
+    async with context.application.bot:
+        # Get all deals (could be optimized with a WHERE clause)
+        # We'll rely on db and then check get_chat_member for both ids
+        # Note: keep limit; here we fetch a batch of deals to avoid scanning huge tables.
+        # For simple use, we fetch all deals where status != posted and both confirmed true.
+        # We'll query using a small raw SQL inside DB layer for simplicity:
+        import aiosqlite
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute("SELECT * FROM deals WHERE status != 'posted' AND buyer_confirmed = 1 AND seller_confirmed = 1")
+            rows = await cur.fetchall()
+            for row in rows:
+                d = dict(row)
+                b_id = d.get("buyer_user_id")
+                s_id = d.get("seller_user_id")
+                if not b_id or not s_id:
+                    continue
+                try:
+                    b_stat = await context.bot.get_chat_member(DVA_GROUP_ID, b_id)
+                    s_stat = await context.bot.get_chat_member(DVA_GROUP_ID, s_id)
+                    b_in = b_stat.status in ("member", "administrator", "creator")
+                    s_in = s_stat.status in ("member", "administrator", "creator")
+                except Exception:
+                    b_in = s_in = False
+                if b_in and s_in:
+                    await post_deal_to_dva(context, d["id"])
 
+async def admin_only_check(context: ContextTypes.DEFAULT_TYPE, admin_user_id: int, chat_id: int) -> bool:
     try:
-        if cfg.LOG_CHANNEL_ID:
-            await context.bot.send_message(cfg.LOG_CHANNEL_ID, f"[DEAL CLOSED]\n{closed_text}")
-    except Exception as e:
-        logger.warning("Failed to post to log channel: %s", e)
+        member = await context.bot.get_chat_member(chat_id, admin_user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
 
-
-async def list_forms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
+async def adddeal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /adddeal <DVAid>  OR reply to deal message
+    if update.effective_chat.id != DVA_GROUP_ID:
+        return
     user = update.effective_user
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works in groups only.")
-        return
-
-    is_admin = await utils.is_user_admin(context.bot, chat.id, user.id)
+    is_admin = await admin_only_check(context, user.id, DVA_GROUP_ID)
     if not is_admin:
-        await update.message.reply_text("Only group admins can list forms.")
+        await update.message.reply_text("Only DVA group admins can use this command.")
         return
 
-    rows = db.list_forms(chat.id)
-    if not rows:
-        await update.message.reply_text("No pending forms.")
+    deal_code = None
+    if context.args:
+        deal_code = context.args[0].strip()
+    elif update.message.reply_to_message:
+        # try to extract deal_id from replied bot message (search "Deal ID: DVA####")
+        text = update.message.reply_to_message.text or ""
+        import re
+        m = re.search(r"Deal ID:\s*(DVA\d+)", text)
+        if m:
+            deal_code = m.group(1)
+
+    if not deal_code:
+        await update.message.reply_text("Usage: /adddeal <DVAid> or reply to the bot's deal message and run /adddeal")
         return
 
-    text = "Pending forms:\n"
-    for r in rows:
-        text += f"ID {r['id']}: {r['form_type']} buyer:{r['buyer']} seller:{r['seller']} amount:{r['amount']} created:{r['created_at']}\n"
-    await update.message.reply_text(text)
+    deal = await db.get_deal(by_code=deal_code)
+    if not deal:
+        await update.message.reply_text("Deal not found.")
+        return
 
+    await db.set_added_by(deal["id"], user.id, user.username or str(user.id))
+    # edit the posted message to include admin
+    if deal.get("posted_message_id"):
+        try:
+            msg = await context.bot.edit_message_text(
+                chat_id=DVA_GROUP_ID,
+                message_id=deal["posted_message_id"],
+                text=(
+                    f"🤝 Deal Info\n"
+                    f"💰 Received: {deal['amount']}\n"
+                    f"🆔 Deal ID: {deal['deal_code']}\n"
+                    f"ℹ️ Details: {deal['details'] or '—'}\n\n"
+                    f"👤 Buyer: @{deal['buyer_username']}\n"
+                    f"👨‍💼 Seller: @{deal['seller_username']}\n"
+                    f"🔐 DVA admin By: @{user.username or user.id}\n"
+                    f"\n⏰ Created: {fmt_time_india(deal['created_at'])}"
+                )
+            )
+        except Exception as e:
+            logger.warning("Failed to edit message: %s", e)
+    await update.message.reply_text(f"Deal {deal_code} registered as added by @{user.username or user.id}")
+    await log_to_channel(context.application, f"[{now_iso()}] Deal {deal_code} added by @{user.username or user.id}")
 
-async def list_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /close <DVAid> or reply to deal message
+    if update.effective_chat.id != DVA_GROUP_ID:
+        return
     user = update.effective_user
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("This command works in groups only.")
-        return
-
-    is_admin = await utils.is_user_admin(context.bot, chat.id, user.id)
+    is_admin = await admin_only_check(context, user.id, DVA_GROUP_ID)
     if not is_admin:
-        await update.message.reply_text("Only group admins can list deals.")
+        await update.message.reply_text("Only DVA group admins can use this command.")
         return
 
-    rows = db.list_deals(chat.id)
-    if not rows:
-        await update.message.reply_text("No deals found.")
+    deal_code = None
+    if context.args:
+        deal_code = context.args[0].strip()
+    elif update.message.reply_to_message:
+        text = update.message.reply_to_message.text or ""
+        import re
+        m = re.search(r"Deal ID:\s*(DVA\d+)", text)
+        if m:
+            deal_code = m.group(1)
+
+    if not deal_code:
+        await update.message.reply_text("Usage: /close <DVAid> or reply to the bot's deal message and run /close")
         return
 
-    text = "Deals:\n"
-    for r in rows:
-        text += f"Deal {r['id']} (Form {r['form_id']}): status:{r['status']} admin:{r['admin_username']} created:{r['created_at']} closed:{r['closed_at']}\n"
-    await update.message.reply_text(text)
+    deal = await db.get_deal(by_code=deal_code)
+    if not deal:
+        await update.message.reply_text("Deal not found.")
+        return
 
+    kick_time = await db.set_closed(deal["id"], user.id, user.username or str(user.id))
+    await update.message.reply_text(f"Deal {deal_code} closed by @{user.username or user.id}. Participants will be removed after 15 minutes (at {kick_time} UTC).")
+    await log_to_channel(context.application, f"[{now_iso()}] Deal {deal_code} closed by @{user.username or user.id}")
+
+async def kick_worker(app):
+    # background loop to check for closed deals due to be kicked
+    while True:
+        try:
+            pending = await db.get_pending_kicks()
+            import datetime
+            now = datetime.datetime.utcnow()
+            for d in pending:
+                if not d.get("kick_time"):
+                    continue
+                kt = datetime.datetime.fromisoformat(d["kick_time"])
+                if now >= kt and d.get("kicked") == 0:
+                    buyer_id = d.get("buyer_user_id")
+                    seller_id = d.get("seller_user_id")
+                    # try to kick users (ban then unban quickly)
+                    for uid in (buyer_id, seller_id):
+                        if not uid:
+                            continue
+                        try:
+                            await app.bot.ban_chat_member(DVA_GROUP_ID, uid)
+                            # unban so they may rejoin later
+                            await app.bot.unban_chat_member(DVA_GROUP_ID, uid)
+                        except Exception as e:
+                            logger.warning("Failed to kick user %s for deal %s: %s", uid, d["deal_code"], e)
+                    await db.mark_kicked(d["id"])
+                    await log_to_channel(app, f"[{now_iso()}] Kicked participants of deal {d['deal_code']}")
+        except Exception as e:
+            logger.error("Kick worker error: %s", e)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 def main():
-    token = cfg.BOT_TOKEN
-    if not token or token == "PUT-YOUR-TOKEN-HERE":
-        raise RuntimeError("Set BOT_TOKEN in config.py or environment variable BOT_TOKEN")
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app = ApplicationBuilder().token(token).build()
+    # init db synchronously before start
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(db.init())
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("form", form_start)],
-        states={
-            T_FORM_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, form_type)],
-            T_BUYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, form_buyer)],
-            T_SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, form_seller)],
-            T_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, form_amount)],
-            T_PURPOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, form_purpose)],
-            T_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, form_confirm)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True,
-    )
+    # handlers
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & filters.Regex(r'(?i)^@admins'), handle_group_form))
+    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(MessageHandler(filters.Chat(DVA_GROUP_ID) & filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_members_in_dva))
+    application.add_handler(CommandHandler("adddeal", adddeal_cmd))
+    application.add_handler(CommandHandler("close", close_cmd))
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("add", add_command))
-    app.add_handler(CommandHandler("close", close_command))
-    app.add_handler(CommandHandler("list_forms", list_forms))
-    app.add_handler(CommandHandler("list_deals", list_deals))
+    # start background worker on post_init
+    async def on_startup(app):
+        app.create_task(kick_worker(app))
 
-    logger.info("Starting bot...")
-    app.run_polling()
+    application.post_init = on_startup
 
+    logger.info("Starting DVA bot...")
+    application.run_polling()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        traceback.print_exc()
+    main()
