@@ -1,7 +1,7 @@
 # db.py
 import aiosqlite
 from datetime import datetime, timedelta
-from typing import Optional, Any
+from typing import Optional
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS deals (
