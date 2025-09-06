@@ -1,10 +1,10 @@
 # utils.py
 import re
-from typing import Optional, Dict
-import pytz
-import datetime
-from dotenv import load_dotenv
 import os
+from typing import Optional, Dict
+from datetime import datetime
+import pytz
+from dotenv import load_dotenv
 
 load_dotenv()
 
