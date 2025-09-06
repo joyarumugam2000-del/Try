@@ -1,24 +1,35 @@
-import random, string, time
-from telegram.ext import ContextTypes
-from telegram import ChatMember
+"""
+utils.py - small helpers
+"""
 
-# Generate unique deal code
-def gen_deal_code() -> str:
-    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    return f"DL-{suffix}"
+import datetime
+import config as cfg
 
-# Current timestamp
-def now_ts() -> int:
-    return int(time.time())
 
-# Check if user is bot owner
-async def is_owner(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    return str(user_id) == str(context.bot_data.get("OWNER_ID"))
+def now_iso():
+    # UTC timestamps formatted for readability
+    return datetime.datetime.utcnow().strftime(cfg.TIME_FORMAT)
 
-# Check if user is admin in chat
-async def is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+
+async def is_user_admin(bot, chat_id: int, user_id: int) -> bool:
+    """
+    Return True if user is an admin or creator in the chat.
+    """
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in [ChatMember.ADMINISTRATOR, ChatMember.CREATOR]
-    except:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
         return False
+
+
+def shorten_username(u: str, keep_front: int = 3, keep_back: int = 2) -> str:
+    """
+    Shorten @username to style like @T...x if it's long.
+    If username is short, returns as-is.
+    """
+    if not u or not u.startswith("@"):
+        return u
+    name = u[1:]
+    if len(name) <= (keep_front + keep_back + 1):
+        return u
+    return "@" + name[:keep_front] + "..." + name[-keep_back:]
