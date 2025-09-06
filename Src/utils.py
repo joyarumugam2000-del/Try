@@ -3,7 +3,7 @@ utils.py - small helpers
 """
 
 import datetime
-import config as cfg
+from . import config as cfg
 
 
 def now_iso():
