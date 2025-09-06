@@ -1,15 +1,25 @@
-# copy this to config.py and update values
 import os
 
 # Bot token from @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8009833248:AAFGG6NnHPzQdg0nRxf4PaGVVpzwyhKgbLg")
 
-# Channel (or group) ID where logs will be posted. Use numeric ID (e.g., -1001234567890).
-# If you don't want logging, set to 0 or leave as default 0.
+# DVA Deal Group (where active deals are posted/managed)
+DVA_GROUP_ID = int(os.getenv("DVA_GROUP_ID", "-1002841591689"))  
+
+# Permanent invite link for the DVA Deal Group
+DVA_INVITE_LINK = os.getenv("DVA_INVITE_LINK", "https://t.me/+GCPImadK3e03M2I1")
+
+# Channel (or group) ID where logs will be posted
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002412313028"))
 
-# Path to SQLite DB
-DB_PATH = os.getenv("DB_PATH", "bot_database.sqlite3")
+# Path to SQLite DB (will auto-create if not present)
+DB_PATH = os.getenv("DB_PATH", "./dva.db")
 
-# Time format for display (UTC)
-TIME_FORMAT = os.getenv("TIME_FORMAT", "%d-%m-%Y %I:%M:%S %p UTC")
+# Optional: Always treat these users as admins (comma-separated numeric user_ids)
+ADMIN_USER_IDS = [int(uid) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
+
+# Timezone for all timestamps (IST in your case)
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
+
+# Background poll interval to check for deal close → auto-kick (in seconds)
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "20"))
