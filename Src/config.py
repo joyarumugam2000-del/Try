@@ -13,7 +13,7 @@ DVA_INVITE_LINK = os.getenv("DVA_INVITE_LINK", "https://t.me/+GCPImadK3e03M2I1")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002412313028"))
 
 # Admins: list of Telegram user IDs who can start/cancel deals
-ADMIN_IDS = [123456789, 987654321]  # replace with your admin IDs
+ADMIN_IDS = [1798791768]  # replace with your admin IDs
 
 # Kick delay in seconds (e.g., 30 minutes)
 KICK_DELAY = int(os.getenv("KICK_DELAY", 1800))
