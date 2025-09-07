@@ -1,4 +1,4 @@
-from db import get_deal, update_deal
+from Src.db import get_deal, update_deal
 
 async def join_deal_buyer(user_id, deal_id):
     deal = get_deal(deal_id)
