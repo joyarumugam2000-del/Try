@@ -1,7 +1,7 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from utils import generate_deal_id, kick_users_after_delay
-from db import add_deal, get_deal, update_deal
-from config import DVA_GROUP_ID, KICK_DELAY
+from Src.utils import generate_deal_id, kick_users_after_delay
+from Src.db import add_deal, get_deal, update_deal
+from Src.config import DVA_GROUP_ID, KICK_DELAY
 import asyncio
 
 def create_deal_buttons(deal_id, seller_id, buyer_id):
