@@ -1,9 +1,9 @@
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram import Update
-from config import BOT_TOKEN, ADMIN_IDS
-from deals import post_deal, start_deal, cancel_deal
-from seller import join_deal_seller
-from buyer import join_deal_buyer
+from Src.config import BOT_TOKEN, ADMIN_IDS
+from Src.deals import post_deal, start_deal, cancel_deal
+from Src.seller import join_deal_seller
+from Src.buyer import join_deal_buyer
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send your deal form:\nSeller: @username\nBuyer: @username\nAmount: 100\nMore details: optional")
